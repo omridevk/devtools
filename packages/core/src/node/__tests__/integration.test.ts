@@ -58,6 +58,7 @@ describe('devToolsIntegration', () => {
       'vite:devtools',
       'vite:devtools:builtin',
       'vite:devtools:injection',
+      'vite:devtools:injection-client',
       'vite:devtools:server',
     ])
   })

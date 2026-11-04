@@ -3,6 +3,10 @@ import type { DevToolsUserOptions } from '../plugin-options'
 import { DEVTOOLS_MOUNT_PATH } from '@vitejs/devtools-kit/constants'
 import { diagnostics } from '../diagnostics'
 
+function createBootstrapCode(src: string): string {
+  return `const s = document.createElement('script'); s.type = 'module'; s.src = ${src}; document.body.appendChild(s);`
+}
+
 /**
  * Inject the `@devframes/hub-ui` embedded bootstrap into the host app's HTML.
  * The hub serves the prebuilt, self-contained module at `<base>embedded.js`
@@ -22,14 +26,14 @@ import { diagnostics } from '../diagnostics'
  * keeps `<base>embedded.js` out of Vite's graph entirely, so the browser
  * fetches it straight from the hub with its real URL intact.
  */
-export function DevToolsInjection(build?: DevToolsUserOptions['build']): Plugin {
+export function DevToolsInjection(build?: DevToolsUserOptions['build']): Plugin[] {
   let src = `${DEVTOOLS_MOUNT_PATH}embedded.js`
 
-  return {
+  const htmlPlugin: Plugin = {
     name: 'vite:devtools:injection',
     enforce: 'post',
-    apply(_config, env) {
-      return !env.isSsrBuild && (env.command === 'serve' || build?.injection === true)
+    apply(config, env) {
+      return !env.isSsrBuild && (env.command === 'build' ? build?.injection === true : !!config.experimental?.bundledDev)
     },
     configResolved(config) {
       if (config.command === 'build') {
@@ -45,11 +49,32 @@ export function DevToolsInjection(build?: DevToolsUserOptions['build']): Plugin 
           {
             tag: 'script',
             attrs: { type: 'module' },
-            children: `const s = document.createElement('script'); s.type = 'module'; s.src = ${JSON.stringify(src)}; document.body.appendChild(s);`,
+            children: createBootstrapCode(JSON.stringify(src)),
             injectTo: 'body',
           },
         ]
       },
     },
   }
+
+  // Dev without bundling: every page loads Vite's HMR client once, whoever
+  // renders the HTML (SPA, SSR, RSC), so the bootstrap rides on that module.
+  const viteClientPlugin: Plugin = {
+    name: 'vite:devtools:injection-client',
+    apply: 'serve',
+    applyToEnvironment(environment) {
+      return environment.config.consumer === 'client' && !environment.config.isBundled
+    },
+    transform: {
+      filter: { id: /\/client\.mjs(?:\?|$)/ },
+      async handler(code, id) {
+        const viteClient = await this.resolve('/@vite/client')
+        if (!viteClient || viteClient.id !== id.replace(/[?#].*$/, ''))
+          return
+        return `${code}\n{ ${createBootstrapCode(`new URL(${JSON.stringify(src)}, import.meta.url)`)} }\n`
+      },
+    },
+  }
+
+  return [htmlPlugin, viteClientPlugin]
 }
