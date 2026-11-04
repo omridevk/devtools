@@ -3,27 +3,39 @@ import type { DevToolsUserOptions } from '../plugin-options'
 import { DEVTOOLS_MOUNT_PATH } from '@vitejs/devtools-kit/constants'
 import { diagnostics } from '../diagnostics'
 
+const VITE_CLIENT_ID_FILTER = /\/dist\/client\/client\.mjs(?:\?.*)?$/
+
 /**
- * Inject the `@devframes/hub-ui` embedded bootstrap into the host app's HTML.
- * The hub serves the prebuilt, self-contained module at `<base>embedded.js`
- * (the `ui.embedded` slot); the client bundles its own framework and styles
- * and reads its reveal policy and dock preferences from the connection meta
- * (`ConnectionMeta.configs.ui`, seeded by `createUi`), so the host app's build
- * never processes it.
+ * Loads the `@devframes/hub-ui` embedded bootstrap (`<base>embedded.js`) at
+ * runtime by appending a module `<script>`. A static root-relative module
+ * `src` would make Vite try to pre-transform `<base>embedded.js` through its
+ * own module pipeline, which breaks the client's `import.meta.url`-relative
+ * asset fetches, so the element is always created at runtime.
+ */
+function createBootstrapCode(src: string, base: 'document' | 'module'): string {
+  const url = base === 'module'
+    ? `new URL(${JSON.stringify(src)}, import.meta.url).href`
+    : JSON.stringify(src)
+  return `{ const s = document.createElement('script'); s.type = 'module'; s.src = ${url}; document.head.appendChild(s); }`
+}
+
+/**
+ * Inject the dock into the host page.
  *
- * The bootstrap is loaded by an **inline** module that creates the `<script>`
- * element at runtime, rather than a static `<script type="module" src=…>`.
- * A static root-relative module `src` makes Vite try to pre-transform
- * `<base>embedded.js` through its own module pipeline — it isn't a project
- * file, so Vite logs a load error and (depending on version) can shadow the
- * hub-served module, which breaks the client's `import.meta.url`-relative
- * `branding.json` fetch (the dock then falls back to the default accent
- * instead of the Vite DevTools brand color). Injecting the element at runtime
- * keeps `<base>embedded.js` out of Vite's graph entirely, so the browser
- * fetches it straight from the hub with its real URL intact.
+ * Dev: the bootstrap is appended to Vite's own HMR client (`/@vite/client`)
+ * in environments whose `consumer` is `'client'`. Every page Vite serves in
+ * dev loads that module exactly once, whoever renders the HTML: `index.html`
+ * (Vite injects it), SSR frameworks (pulled in by import analysis or emitted
+ * by the framework), RSC setups, backend integrations. No framework knowledge
+ * and no HTML hook is needed, and the browser evaluates the module once per
+ * document, so the dock is injected once.
+ *
+ * Build (`build.injection`) and bundled dev (`experimental.bundledDev`), where
+ * the HMR client is not a separate module: fall back to `transformIndexHtml`.
  */
 export function DevToolsInjection(build?: DevToolsUserOptions['build']): Plugin {
   let src = `${DEVTOOLS_MOUNT_PATH}embedded.js`
+  let injectIntoHtml = false
 
   return {
     name: 'vite:devtools:injection',
@@ -37,15 +49,29 @@ export function DevToolsInjection(build?: DevToolsUserOptions['build']): Plugin 
           throw diagnostics.DTK0035({})
         src = `${config.base.replace(/\/+$/, '')}${DEVTOOLS_MOUNT_PATH}embedded.js`
       }
+      injectIntoHtml = config.command === 'build' || !!config.experimental?.bundledDev
+    },
+    transform: {
+      filter: { id: VITE_CLIENT_ID_FILTER },
+      async handler(code, id) {
+        if (injectIntoHtml || this.environment.config.consumer !== 'client')
+          return
+        const viteClient = await this.resolve('/@vite/client')
+        if (!viteClient || viteClient.id !== id.split('?')[0])
+          return
+        return { code: `${code}\n${createBootstrapCode(src, 'module')}\n`, map: null }
+      },
     },
     transformIndexHtml: {
       order: 'pre',
       handler() {
+        if (!injectIntoHtml)
+          return
         return [
           {
             tag: 'script',
             attrs: { type: 'module' },
-            children: `const s = document.createElement('script'); s.type = 'module'; s.src = ${JSON.stringify(src)}; document.body.appendChild(s);`,
+            children: createBootstrapCode(src, 'document'),
             injectTo: 'body',
           },
         ]
